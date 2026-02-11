@@ -7,6 +7,7 @@
 
 import fnmatch
 import os
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional
 
 from litellm._logging import verbose_proxy_logger
@@ -65,8 +66,9 @@ def _sanitize_inbound_headers(headers: Any) -> Optional[Dict[str, str]]:
     - Allowlist: only headers in the allowlist have their values forwarded (exact + glob: x-stainless-*, x-litellm-*).
     - All other headers are included with value "[present]" so the guardrail knows the header existed.
     - Coerces values to str (for JSON serialization).
+    - Accepts any Mapping (e.g. Starlette/FastAPI Headers), not only plain dict.
     """
-    if not headers or not isinstance(headers, dict):
+    if not headers or not isinstance(headers, Mapping):
         return None
 
     sanitized: Dict[str, str] = {}
@@ -309,7 +311,9 @@ class GenericGuardrailAPI(CustomGuardrail):
 
         # Extract user API key metadata
         user_metadata = self._extract_user_api_key_metadata(request_data)
-        inbound_headers = _extract_inbound_headers(request_data=request_data, logging_obj=logging_obj)
+        inbound_headers = _extract_inbound_headers(
+            request_data=request_data, logging_obj=logging_obj
+        )
 
         # Create request payload
         guardrail_request = GenericGuardrailAPIRequest(
