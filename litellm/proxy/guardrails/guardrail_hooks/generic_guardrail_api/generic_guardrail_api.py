@@ -40,6 +40,13 @@ from .background_dispatch import (
     DEFAULT_FIRE_AND_FORGET_MAX_INFLIGHT,
     BackgroundDispatcher,
 )
+from .payload_policy import (
+    PayloadLoss,
+    PayloadPolicy,
+    merge_guardrailed_texts,
+    resolve_exclude_fields,
+    shape_payload,
+)
 from .record_scope import (
     DEFAULT_GUARDRAIL_INFORMATION_SCOPE,
     GuardrailInformationScope,
@@ -248,6 +255,11 @@ class GenericGuardrailAPI(CustomGuardrail):
         skip_if_team_id_in: Sequence[str] | None = None,
         run_only_on_call_types: Sequence[str] | None = None,
         skip_call_types: Sequence[str] | None = None,
+        send_images: bool | None = None,
+        exclude_payload_fields: Sequence[str] | None = None,
+        max_messages: int | None = None,
+        max_text_chars: int | None = None,
+        strip_patterns: Sequence[str] | None = None,
         fire_and_forget: bool | None = None,
         fire_and_forget_max_inflight: int | None = None,
         guardrail_information_scope: GuardrailInformationScope | None = None,
@@ -314,6 +326,15 @@ class GenericGuardrailAPI(CustomGuardrail):
             ),
         )
 
+        self._payload_policy: Final = PayloadPolicy(
+            observe_only=self.fire_and_forget,
+            send_images=True if send_images is None else send_images,
+            exclude_fields=resolve_exclude_fields(exclude_payload_fields, guardrail_name=configured_name),
+            max_messages=max_messages,
+            max_text_chars=max_text_chars,
+            strip_patterns=compile_patterns(strip_patterns, option_name="strip_patterns"),
+        )
+
         self._skip_policy: Final = SkipPolicy(
             system_prompt_patterns=compile_patterns(
                 skip_if_system_prompt_matches, option_name="skip_if_system_prompt_matches"
@@ -353,6 +374,17 @@ class GenericGuardrailAPI(CustomGuardrail):
                 self.unreachable_fallback,
             )
             self.streaming_end_of_stream_only = True
+
+        if self._payload_policy.is_lossy and not self.fire_and_forget:
+            # Whatever the shaping leaves out is never scanned, so an enforcing
+            # guardrail cannot act on it. Fine for an observer, worth saying out
+            # loud for a guardrail that can still block.
+            verbose_proxy_logger.warning(
+                "Generic Guardrail API (%s): max_messages / max_text_chars / strip_patterns / excluded text "
+                "keep part of the request from ever reaching the guardrail, so it can only enforce on what it "
+                "is sent. Content outside the configured window cannot be blocked or masked.",
+                configured_name,
+            )
 
         if self._skip_policy.filters_requests:
             verbose_proxy_logger.warning(
@@ -504,14 +536,16 @@ class GenericGuardrailAPI(CustomGuardrail):
 
         self._dispatcher.dispatch(_post, context=context)
 
-    def _build_payload(self, guardrail_request: GenericGuardrailAPIRequest) -> Mapping[str, JsonValue]:
-        """Build the JSON body for the guardrail call.
+    def _build_payload(
+        self, guardrail_request: GenericGuardrailAPIRequest
+    ) -> tuple[Mapping[str, JsonValue], PayloadLoss]:
+        """Build the JSON body for the guardrail call, plus the loss it represents.
 
-        One home for payload construction, so what is sent is decided in a single
-        place rather than inline at the call site. mode="json" ensures all
-        iterables are converted to lists.
+        Shaping happens here so the awaited and the fire_and_forget paths send
+        exactly the same bytes, and so the caller knows which components the
+        guardrail never saw in full.
         """
-        return guardrail_request.model_dump(mode="json")
+        return shape_payload(guardrail_request, self._payload_policy)
 
     def _build_request_headers(self) -> dict:
         """Build HTTP headers for the guardrail API request."""
@@ -527,16 +561,24 @@ class GenericGuardrailAPI(CustomGuardrail):
         images: Any,
         tools: Any,
         guardrail_response: GenericGuardrailAPIResponse,
+        loss: PayloadLoss,
     ) -> GenericGuardrailAPIInputs:
-        # Action is NONE or no modifications needed
+        # Action is NONE or no modifications needed. A component the guardrail
+        # never received in full (payload shaping) keeps the caller's original
+        # value: it cannot rewrite what it could not see.
         return_inputs: Final = GenericGuardrailAPIInputs(texts=texts)
         if guardrail_response.texts:
-            return_inputs["texts"] = guardrail_response.texts
-        if guardrail_response.images:
+            return_inputs["texts"] = merge_guardrailed_texts(
+                original=texts,
+                returned=guardrail_response.texts,
+                loss=loss,
+                guardrail_name=getattr(self, "guardrail_name", None),
+            )
+        if guardrail_response.images and not loss.images_omitted:
             return_inputs["images"] = guardrail_response.images
         elif images:
             return_inputs["images"] = images
-        if guardrail_response.tools:
+        if guardrail_response.tools and not loss.tools_omitted:
             return_inputs["tools"] = guardrail_response.tools
         elif tools:
             return_inputs["tools"] = tools
@@ -711,7 +753,7 @@ class GenericGuardrailAPI(CustomGuardrail):
 
             headers: Final = self._build_request_headers()
 
-            payload: Final = self._build_payload(guardrail_request)
+            payload, payload_loss = self._build_payload(guardrail_request)
 
             if self.fire_and_forget:
                 self._dispatch_background_post(
@@ -752,6 +794,7 @@ class GenericGuardrailAPI(CustomGuardrail):
                 images=images,
                 tools=tools,
                 guardrail_response=guardrail_response,
+                loss=payload_loss,
             )
 
         except GuardrailRaisedException:

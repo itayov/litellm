@@ -37,6 +37,9 @@ def is_text_content_call_type(call_type: str) -> bool:
 
 TEXT_PART_TYPES: Final[frozenset[str]] = frozenset({"text", "input_text", "output_text"})
 
+# Content part types whose payload is image data (Chat Completions and Responses API).
+IMAGE_PART_TYPES: Final[frozenset[str]] = frozenset({"image_url", "input_image"})
+
 # A text rewrite applied to one fragment at a time.
 TextTransform: TypeAlias = Callable[[str], str]
 
@@ -150,6 +153,82 @@ def _mapped_text_part(part: JsonValue, transform: TextTransform) -> JsonValue:
     if not isinstance(text, str) or not text:
         return part
     return {**part, "text": transform(text)}  # mutable-ok: JSON parts are dicts
+
+
+def iter_messages_text(messages: Sequence[Mapping[str, object]]) -> Iterator[str]:
+    """Yield every text fragment carried by a message list, whatever the role.
+
+    Role-agnostic on purpose: a caller counting what a set of messages
+    contributes (payload windowing, size accounting) must not miss a turn whose
+    role it did not think to enumerate.
+    """
+    for message in messages:
+        # The annotation is the contract; the values arrive from provider
+        # translation handlers, so a stray non-message entry must not raise.
+        if isinstance(message, Mapping):  # pyright: ignore[reportUnnecessaryIsInstance]  # untyped upstream data
+            yield from _iter_text_parts_in_content(message.get("content"))
+
+
+def map_content_image_urls(content: JsonValue, transform: TextTransform) -> JsonValue:
+    """Return ``content`` with every image payload replaced by ``transform(url)``.
+
+    Covers both image part shapes: Chat Completions ``{"type": "image_url",
+    "image_url": {"url": ...}}`` (and its bare-string variant) and the
+    Responses-API ``{"type": "input_image", "image_url": ...}``. Everything else
+    is passed through by reference.
+    """
+    if not isinstance(content, list):
+        return content
+    return [_mapped_image_part(part, transform) for part in content]  # mutable-ok: JSON content is a list
+
+
+def _mapped_image_part(part: JsonValue, transform: TextTransform) -> JsonValue:
+    if not isinstance(part, dict) or part.get("type") not in IMAGE_PART_TYPES:
+        return part
+    image_url: Final = part.get("image_url")
+    if isinstance(image_url, str):
+        return {**part, "image_url": transform(image_url)}  # mutable-ok: JSON parts are dicts
+    if not isinstance(image_url, dict):
+        return part
+    url: Final = image_url.get("url")
+    if not isinstance(url, str):
+        return part
+    nested: Final = {**image_url, "url": transform(url)}  # mutable-ok: JSON parts are dicts
+    return {**part, "image_url": nested}  # mutable-ok: JSON parts are dicts
+
+
+def map_messages_image_urls(messages: JsonValue, transform: TextTransform) -> JsonValue:
+    """Return a new message list with every image payload transformed."""
+    return _mapped_messages(messages, map_content_image_urls, transform)
+
+
+def map_messages_text(messages: JsonValue, transform: TextTransform) -> JsonValue:
+    """Return a new message list with every ``content`` text fragment transformed.
+
+    Roles, ids, tool calls, tool schemas and any other key are copied through
+    untouched, so only text can differ from the input.
+    """
+    return _mapped_messages(messages, map_content_text, transform)
+
+
+def _mapped_messages(
+    messages: JsonValue,
+    map_content: Callable[[JsonValue, TextTransform], JsonValue],
+    transform: TextTransform,
+) -> JsonValue:
+    if not isinstance(messages, list):
+        return messages
+    return [_mapped_message(message, map_content, transform) for message in messages]  # mutable-ok: JSON is a list
+
+
+def _mapped_message(
+    message: JsonValue,
+    map_content: Callable[[JsonValue, TextTransform], JsonValue],
+    transform: TextTransform,
+) -> JsonValue:
+    if not isinstance(message, dict) or "content" not in message:
+        return message
+    return {**message, "content": map_content(message["content"], transform)}  # mutable-ok: JSON messages are dicts
 
 
 def walk_user_text(data: dict[str, Any], visit: Callable[[str], str]) -> int:

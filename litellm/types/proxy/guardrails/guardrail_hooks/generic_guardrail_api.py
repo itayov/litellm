@@ -211,6 +211,67 @@ class GenericGuardrailAPIOptionalParams(BaseModel):
         ),
     )
 
+    send_images: bool | None = Field(
+        default=None,
+        description=(
+            "If False, base64 image data is omitted from the guardrail request even when the "
+            "LLM request contains images. Large payload saver for guardrails that only "
+            "inspect text. Images the guardrail never received cannot be rewritten by its "
+            "response. Defaults to True in GenericGuardrailAPI.__init__ when None."
+        ),
+    )
+
+    exclude_payload_fields: tuple[str, ...] | None = Field(
+        default=None,
+        description=(
+            "Top-level GenericGuardrailAPIRequest keys to omit from the payload (e.g. "
+            "['images','texts','request_headers']), for providers that do not consume them. "
+            "Unknown keys and the routing-critical keys input_type and litellm_call_id are "
+            "ignored with a warning at init. A component that is not sent cannot be "
+            "rewritten by the guardrail response."
+        ),
+    )
+
+    max_messages: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "If set, only the last N entries of structured_messages and the last N text "
+            "blocks are sent. Bounds payload size when the full conversation is re-sent "
+            "every turn. Note the system prompt and early context fall out of the window "
+            "once the session exceeds N. LOSSY: windowing shifts text positions, so the "
+            "guardrail can no longer rewrite text on this call (action=BLOCKED still "
+            "applies); leave it unset on a guardrail that masks or redacts."
+        ),
+    )
+
+    max_text_chars: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "If set, each individual text block is truncated to this many characters before "
+            "sending, for providers that only need a prefix. LOSSY: truncated text blocks "
+            "keep their original content on write-back, so the guardrail cannot rewrite them."
+        ),
+    )
+
+    strip_patterns: tuple[str, ...] | None = Field(
+        default=None,
+        description=(
+            "Regex patterns applied to text content (texts[] and the text of each "
+            "structured_messages entry) before the guardrail request is sent. Matches are "
+            "removed. Intended to drop volatile boilerplate the provider does not need. "
+            "Applied only to string text fields, never to JSON structure, tool schemas, ids "
+            "or metadata. LOSSY: stripped content cannot be inspected by the guardrail, and "
+            "stripped text blocks keep their original content on write-back. An invalid "
+            "regex raises at init. Patterns run synchronously on the request path against "
+            "caller-supplied text, and Python's re has no match timeout, so a pattern that "
+            "backtracks catastrophically (nested quantifiers such as (a+)+) can stall the "
+            "worker: keep patterns linear-time. Text over 100k characters is not matched at "
+            "all, and is sent unstripped so an enforcing guardrail still sees it."
+        ),
+    )
+
 
 class GenericGuardrailAPIConfigModel(
     GuardrailConfigModel[GenericGuardrailAPIOptionalParams],
