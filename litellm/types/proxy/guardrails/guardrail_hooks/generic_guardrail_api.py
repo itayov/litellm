@@ -102,6 +102,73 @@ class GenericGuardrailAPIOptionalParams(BaseModel):
         ),
     )
 
+    skip_if_system_prompt_matches: tuple[str, ...] | None = Field(
+        default=None,
+        description=(
+            "Regex patterns matched against the request's system message (role=system or "
+            "developer). On a match the guardrail is skipped for this call: no request is "
+            "sent, and the paired response is skipped too, so both telemetry and enforcement "
+            "are suppressed for matched requests. Matching the system message only (not "
+            "arbitrary user text) avoids false positives from pasted content. Requires a "
+            "request-side hook (pre_call or during_call) in the mode list. "
+            "TRUST BOUNDARY: the system message comes from the request body, so any caller "
+            "who knows the configured pattern can add a system message and exempt itself "
+            "from this guardrail. Treat this as traffic scoping, not as enforcement, and "
+            "prefer skip_if_key_alias_in / skip_if_team_id_in when the exemption has to "
+            "hold against the caller. Patterns run synchronously against caller-supplied "
+            "text, so they must be linear-time for the same reason as strip_patterns."
+        ),
+    )
+
+    skip_if_first_role_in: tuple[str, ...] | None = Field(
+        default=None,
+        description=(
+            "If the first message's role is in this list (e.g. ['developer']), skip the "
+            "guardrail for the call, with the same request/response semantics as, and the "
+            "same trust boundary as, skip_if_system_prompt_matches: the caller chooses the "
+            "roles it sends."
+        ),
+    )
+
+    skip_if_key_alias_in: tuple[str, ...] | None = Field(
+        default=None,
+        description=(
+            "If the calling virtual key's alias is in this list, skip the guardrail for the "
+            "call. Unlike the message-based filters this reads what authentication "
+            "established, so a caller cannot exempt itself by changing its request body. "
+            "Same request/response semantics: neither side is sent."
+        ),
+    )
+
+    skip_if_team_id_in: tuple[str, ...] | None = Field(
+        default=None,
+        description=(
+            "If the calling key's team id is in this list, skip the guardrail for the call. "
+            "Admin-controlled like skip_if_key_alias_in, and matched on the same "
+            "authenticated metadata."
+        ),
+    )
+
+    run_only_on_call_types: tuple[str, ...] | None = Field(
+        default=None,
+        description=(
+            "If set, the guardrail runs ONLY for these call types (e.g. "
+            "['completion','acompletion','anthropic_messages','responses','aresponses']). All "
+            "other call types, including embeddings, image generation, audio, rerank and "
+            "moderation, are skipped before any request is sent. Allowlist; takes precedence "
+            "over skip_call_types. Values are CallTypes names. An unresolvable call type runs."
+        ),
+    )
+
+    skip_call_types: tuple[str, ...] | None = Field(
+        default=None,
+        description=(
+            "If set (and run_only_on_call_types is not), the guardrail is skipped for these "
+            "call types (e.g. ['embedding','aembedding','image_generation','transcription',"
+            "'speech','rerank','moderation']). Denylist. Values are CallTypes names."
+        ),
+    )
+
 
 class GenericGuardrailAPIConfigModel(
     GuardrailConfigModel[GenericGuardrailAPIOptionalParams],

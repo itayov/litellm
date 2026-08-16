@@ -7,7 +7,7 @@
 
 import fnmatch
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Final, Literal, Optional
 
 import httpx
@@ -21,10 +21,11 @@ from litellm.integrations.custom_guardrail import (
     log_guardrail_information,
 )
 from litellm.llms.custom_httpx.http_handler import (
+    AsyncHTTPHandler,
     get_async_httpx_client,
     httpxSpecialProvider,
 )
-from litellm.types.guardrails import GuardrailEventHooks
+from litellm.types.guardrails import GuardrailEventHooks, Mode
 from litellm.types.proxy.guardrails.guardrail_hooks.generic_guardrail_api import (
     GenericGuardrailAPIMetadata,
     GenericGuardrailAPIRequest,
@@ -32,6 +33,16 @@ from litellm.types.proxy.guardrails.guardrail_hooks.generic_guardrail_api import
     GuardrailToolParam,
 )
 from litellm.types.utils import GenericGuardrailAPIInputs
+
+from .request_filters import (
+    SkipDecisionStore,
+    SkipPolicy,
+    call_type_allowed,
+    compile_patterns,
+    identity_matches_skip,
+    request_matches_skip,
+    validate_call_types,
+)
 
 if TYPE_CHECKING:
     from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
@@ -150,6 +161,37 @@ def _extract_inbound_headers(
     return None
 
 
+def _resolve_call_type(
+    request_data: Mapping[str, object],
+    logging_obj: Optional["LiteLLMLoggingObj"],
+) -> str | None:
+    """Resolve the call type of the current request.
+
+    The proxy passes the route type straight through to ``function_setup``, which
+    stamps it on the logging object before the pre-call hook runs and keeps it
+    for the post-call hook, so both sides of a call resolve the same value.
+    """
+    from_logging: Final = getattr(logging_obj, "call_type", None) if logging_obj else None
+    if isinstance(from_logging, str) and from_logging:
+        return from_logging
+    from_request: Final = request_data.get("call_type")
+    return from_request if isinstance(from_request, str) and from_request else None
+
+
+def _has_request_side_hook(event_hook: str | Sequence[str] | Mode | None) -> bool:
+    """Whether the configured mode(s) include a hook that sees the request.
+
+    Tag-based ``Mode`` config is resolved per request, so it is treated as having
+    one rather than emitting a warning that may not apply.
+    """
+    request_side: Final = frozenset({GuardrailEventHooks.pre_call.value, GuardrailEventHooks.during_call.value})
+    if event_hook is None or isinstance(event_hook, Mode):
+        return True
+    if isinstance(event_hook, str):
+        return event_hook in request_side
+    return any(hook in request_side for hook in event_hook)
+
+
 def _passthrough_inputs(inputs: GenericGuardrailAPIInputs) -> GenericGuardrailAPIInputs:
     """Return the inputs untouched (same value identities), as action=NONE."""
     return GenericGuardrailAPIInputs(**inputs)
@@ -189,9 +231,18 @@ class GenericGuardrailAPI(CustomGuardrail):
         streaming_end_of_stream_only: bool | None = None,
         streaming_sampling_rate: int | None = None,
         streaming_transform_mode: Literal["block_only", "incremental_diff"] | None = None,
+        skip_if_system_prompt_matches: Sequence[str] | None = None,
+        skip_if_first_role_in: Sequence[str] | None = None,
+        skip_if_key_alias_in: Sequence[str] | None = None,
+        skip_if_team_id_in: Sequence[str] | None = None,
+        run_only_on_call_types: Sequence[str] | None = None,
+        skip_call_types: Sequence[str] | None = None,
+        async_handler: AsyncHTTPHandler | None = None,
         **kwargs,
     ):
-        self.async_handler = get_async_httpx_client(llm_provider=httpxSpecialProvider.GuardrailCallback)
+        self.async_handler = async_handler or get_async_httpx_client(
+            llm_provider=httpxSpecialProvider.GuardrailCallback
+        )
         self.headers = headers or {}
         self.extra_headers = extra_headers or []
 
@@ -235,6 +286,56 @@ class GenericGuardrailAPI(CustomGuardrail):
         self.streaming_transform_mode: Literal["block_only", "incremental_diff"] = (
             "block_only" if streaming_transform_mode is None else streaming_transform_mode
         )
+
+        configured_name: Final = kwargs.get("guardrail_name")
+
+        self._skip_policy: Final = SkipPolicy(
+            system_prompt_patterns=compile_patterns(
+                skip_if_system_prompt_matches, option_name="skip_if_system_prompt_matches"
+            ),
+            first_role_in=frozenset(skip_if_first_role_in or ()),
+            key_aliases=frozenset(skip_if_key_alias_in or ()),
+            team_ids=frozenset(skip_if_team_id_in or ()),
+            run_only_on_call_types=(
+                validate_call_types(
+                    run_only_on_call_types,
+                    option_name="run_only_on_call_types",
+                    guardrail_name=configured_name,
+                )
+                if run_only_on_call_types
+                else None
+            ),
+            skip_call_types=validate_call_types(
+                skip_call_types, option_name="skip_call_types", guardrail_name=configured_name
+            ),
+        )
+        self._skip_store: Final = SkipDecisionStore(guardrail_name=configured_name)
+
+        if self._skip_policy.filters_requests:
+            verbose_proxy_logger.warning(
+                "Generic Guardrail API (%s): skip_if_system_prompt_matches / skip_if_first_role_in match on the "
+                "request body, which the caller controls, so a caller that knows the configured value can exempt "
+                "itself from this guardrail. Use skip_if_key_alias_in / skip_if_team_id_in when the exemption must "
+                "hold against the caller.",
+                configured_name,
+            )
+
+        if self._skip_policy.filters_requests and not _has_request_side_hook(kwargs.get("event_hook")):
+            verbose_proxy_logger.warning(
+                "Generic Guardrail API (%s): skip_if_system_prompt_matches / skip_if_first_role_in need a "
+                "request-side hook (pre_call or during_call) to decide anything. mode=%s only sees "
+                "responses, so nothing will be skipped.",
+                configured_name,
+                kwargs.get("event_hook"),
+            )
+
+        if self._skip_policy.run_only_on_call_types is not None and self._skip_policy.skip_call_types:
+            verbose_proxy_logger.warning(
+                "Generic Guardrail API (%s): both run_only_on_call_types and skip_call_types are set. "
+                "The allowlist wins; skip_call_types=%s is ignored.",
+                configured_name,
+                sorted(self._skip_policy.skip_call_types),
+            )
 
         # Set supported event hooks
         kwargs.setdefault("supported_event_hooks", list(self.get_supported_event_hooks()))
@@ -311,6 +412,35 @@ class GenericGuardrailAPI(CustomGuardrail):
         )
         # Keep flow going - treat as action=NONE (no modifications)
         return _passthrough_inputs(inputs)
+
+    def _should_skip_out_of_scope_request(
+        self,
+        *,
+        input_type: Literal["request", "response"],
+        structured_messages: Sequence[Mapping[str, object]] | None,
+        request_data: Mapping[str, object],
+        logging_obj: Optional["LiteLLMLoggingObj"],
+    ) -> bool:
+        """Whether this call is out of scope per skip_if_* (Feature 4).
+
+        Only the request carries the system prompt, so the response side replays
+        the decision the request side recorded instead of re-deciding.
+        """
+        if not self._skip_policy.filters_requests:
+            return False
+
+        call_id: Final = (getattr(logging_obj, "litellm_call_id", None) if logging_obj else None) or request_data.get(
+            "litellm_call_id"
+        )
+
+        if input_type == "response":
+            return self._skip_store.consume(logging_obj=logging_obj, call_id=call_id)
+
+        if not request_matches_skip(self._skip_policy, structured_messages):
+            return False
+
+        self._skip_store.record(logging_obj=logging_obj, call_id=call_id)
+        return True
 
     def _build_payload(self, guardrail_request: GenericGuardrailAPIRequest) -> Mapping[str, JsonValue]:
         """Build the JSON body for the guardrail call.
@@ -415,6 +545,40 @@ class GenericGuardrailAPI(CustomGuardrail):
         if request_data is None:
             request_data = {}
 
+        # Extract user API key metadata (also the basis of the identity filters below)
+        user_metadata: Final = self._extract_user_api_key_metadata(request_data)
+
+        call_type: Final = _resolve_call_type(request_data=request_data, logging_obj=logging_obj)
+        if not call_type_allowed(self._skip_policy, call_type):
+            verbose_proxy_logger.debug(
+                "Generic Guardrail API: skipping call_type=%s (input_type=%s) per call-type filter",
+                call_type,
+                input_type,
+            )
+            return _passthrough_inputs(inputs)
+
+        if identity_matches_skip(self._skip_policy, user_metadata):
+            verbose_proxy_logger.debug(
+                "Generic Guardrail API: skipping out-of-scope caller (input_type=%s, key_alias=%s, team_id=%s)",
+                input_type,
+                user_metadata.get("user_api_key_alias"),
+                user_metadata.get("user_api_key_team_id"),
+            )
+            return _passthrough_inputs(inputs)
+
+        if self._should_skip_out_of_scope_request(
+            input_type=input_type,
+            structured_messages=structured_messages,
+            request_data=request_data,
+            logging_obj=logging_obj,
+        ):
+            verbose_proxy_logger.debug(
+                "Generic Guardrail API: skipping out-of-scope request (input_type=%s, litellm_call_id=%s)",
+                input_type,
+                getattr(logging_obj, "litellm_call_id", None) if logging_obj else None,
+            )
+            return _passthrough_inputs(inputs)
+
         request_body: Final = request_data.get("body") or {}
 
         # Merge additional provider specific params from config and dynamic params
@@ -425,8 +589,6 @@ class GenericGuardrailAPI(CustomGuardrail):
         if dynamic_params:
             additional_params.update(dynamic_params)
 
-        # Extract user API key metadata
-        user_metadata: Final = self._extract_user_api_key_metadata(request_data)
         extra_allowlist = {h.lower() for h in self.extra_headers if isinstance(h, str)} if self.extra_headers else None
         inbound_headers: Final = _extract_inbound_headers(
             request_data=request_data,

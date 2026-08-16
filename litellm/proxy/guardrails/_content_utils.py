@@ -8,7 +8,7 @@ skip the other shapes — these helpers normalise that so every hook sees
 every text fragment.
 """
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from typing import Any, Final, TypeAlias
 
 from pydantic import JsonValue
@@ -107,6 +107,22 @@ def iter_message_text(data: dict[str, Any]) -> Iterator[str]:
         if not isinstance(message, dict):
             continue
         yield from _iter_text_parts_in_content(message.get("content"))
+
+
+def iter_role_text(messages: Sequence[Mapping[str, object]], roles: Collection[str]) -> Iterator[str]:
+    """Yield every text fragment carried by messages whose role is in ``roles``.
+
+    Lets a hook anchor a decision to a specific role (e.g. the system /
+    developer instructions) instead of the whole transcript, which would match
+    on any user-pasted content.
+    """
+    for message in messages:
+        # The annotation is the contract; the values arrive from provider
+        # translation handlers, so a stray non-message entry must not raise.
+        if not isinstance(message, Mapping):  # pyright: ignore[reportUnnecessaryIsInstance]  # untyped upstream data
+            continue
+        if message.get("role") in roles:
+            yield from _iter_text_parts_in_content(message.get("content"))
 
 
 def map_content_text(content: JsonValue, transform: TextTransform) -> JsonValue:

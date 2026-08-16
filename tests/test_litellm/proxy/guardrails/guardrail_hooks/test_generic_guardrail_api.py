@@ -1996,3 +1996,486 @@ class TestFailOnError:
                     request_data={},
                     input_type="response",
                 )
+
+# ---------------------------------------------------------------------------
+# Payload shaping, applicability filters and fire-and-forget dispatch
+# ---------------------------------------------------------------------------
+
+
+class _RecordingHandler:
+    """Stands in for AsyncHTTPHandler, capturing every posted payload.
+
+    Injected through GenericGuardrailAPI(async_handler=...) so the guardrail
+    under test keeps its real code path and nothing has to be patched onto it.
+    """
+
+    def __init__(self, *, action="NONE", texts=None, images=None, tools=None, error=None):
+        self.calls: list[dict] = []
+        self._action = action
+        self._texts = texts
+        self._images = images
+        self._tools = tools
+        self._error = error
+
+    @property
+    def payloads(self) -> list[dict]:
+        return [call["json"] for call in self.calls]
+
+    async def post(self, *, url, json, headers, **kwargs):
+        self.calls.append({"url": url, "json": json, "headers": headers})
+        if self._error is not None:
+            raise self._error
+        body = {"action": self._action}
+        for key, value in (("texts", self._texts), ("images", self._images), ("tools", self._tools)):
+            if value is not None:
+                body[key] = value
+        response = MagicMock()
+        response.json.return_value = body
+        response.raise_for_status = MagicMock()
+        return response
+
+
+class _StubLoggingObj:
+    """Minimal stand-in for the LiteLLM logging object shared by both hooks."""
+
+    def __init__(self, *, call_type=None, call_id="call-123", trace_id="trace-123"):
+        self.call_type = call_type
+        self.litellm_call_id = call_id
+        self.litellm_trace_id = trace_id
+        self.model_call_details: dict = {}
+
+
+def _make_guardrail(handler, *, dispatcher=None, name="test-generic-guardrail", event_hook="pre_call", **options):
+    return GenericGuardrailAPI(
+        api_base="https://api.test.guardrail.com",
+        guardrail_name=name,
+        event_hook=event_hook,
+        default_on=True,
+        async_handler=handler,
+        dispatcher=dispatcher,
+        **options,
+    )
+
+
+
+class TestCallTypeFilter:
+    """run_only_on_call_types / skip_call_types (call-type applicability)."""
+
+    @pytest.mark.asyncio
+    async def test_allowlist_runs_allowed_call_type(self):
+        handler = _RecordingHandler()
+        guardrail = _make_guardrail(handler, run_only_on_call_types=["acompletion"])
+
+        result = await guardrail.apply_guardrail(
+            inputs={"texts": ["hello"]},
+            request_data={},
+            input_type="request",
+            logging_obj=_StubLoggingObj(call_type="acompletion"),
+        )
+
+        assert len(handler.calls) == 1
+        assert result["texts"] == ["hello"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("input_type", ["request", "response"])
+    async def test_allowlist_skips_embeddings_on_both_hooks(self, input_type):
+        """An embedding call is skipped on request and response alike; each hook
+        resolves its own call type, so no correlation is needed."""
+        handler = _RecordingHandler()
+        guardrail = _make_guardrail(handler, run_only_on_call_types=["acompletion"])
+
+        result = await guardrail.apply_guardrail(
+            inputs={"texts": ["embed me"]},
+            request_data={},
+            input_type=input_type,
+            logging_obj=_StubLoggingObj(call_type="aembedding"),
+        )
+
+        assert handler.calls == []
+        assert result == {"texts": ["embed me"]}
+
+    @pytest.mark.asyncio
+    async def test_unresolved_call_type_still_runs(self):
+        """A call type we cannot resolve must not silently blind the guardrail."""
+        handler = _RecordingHandler()
+        guardrail = _make_guardrail(handler, run_only_on_call_types=["acompletion"])
+
+        await guardrail.apply_guardrail(
+            inputs={"texts": ["hello"]},
+            request_data={},
+            input_type="request",
+            logging_obj=_StubLoggingObj(call_type=None),
+        )
+
+        assert len(handler.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_denylist_skips_listed_call_type_only(self):
+        handler = _RecordingHandler()
+        guardrail = _make_guardrail(handler, skip_call_types=["aembedding", "aspeech"])
+
+        await guardrail.apply_guardrail(
+            inputs={"texts": ["embed me"]},
+            request_data={},
+            input_type="request",
+            logging_obj=_StubLoggingObj(call_type="aembedding"),
+        )
+        assert handler.calls == []
+
+        await guardrail.apply_guardrail(
+            inputs={"texts": ["chat"]},
+            request_data={},
+            input_type="request",
+            logging_obj=_StubLoggingObj(call_type="acompletion"),
+        )
+        assert len(handler.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_allowlist_takes_precedence_over_denylist(self):
+        handler = _RecordingHandler()
+        guardrail = _make_guardrail(
+            handler,
+            run_only_on_call_types=["aembedding"],
+            skip_call_types=["aembedding"],
+        )
+
+        await guardrail.apply_guardrail(
+            inputs={"texts": ["embed me"]},
+            request_data={},
+            input_type="request",
+            logging_obj=_StubLoggingObj(call_type="aembedding"),
+        )
+
+        assert len(handler.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_call_type_from_request_data_when_no_logging_obj(self):
+        handler = _RecordingHandler()
+        guardrail = _make_guardrail(handler, run_only_on_call_types=["acompletion"])
+
+        await guardrail.apply_guardrail(
+            inputs={"texts": ["embed me"]},
+            request_data={"call_type": "aembedding"},
+            input_type="request",
+        )
+
+        assert handler.calls == []
+
+
+class TestRequestApplicabilityFilter:
+    """skip_if_system_prompt_matches / skip_if_first_role_in."""
+
+    MARKER = "internal-agent-7f3c"
+
+    def _guardrail(self, handler, **options):
+        return _make_guardrail(
+            handler,
+            event_hook=["pre_call", "post_call"],
+            skip_if_system_prompt_matches=[self.MARKER],
+            **options,
+        )
+
+    @pytest.mark.asyncio
+    async def test_matching_system_prompt_sends_nothing(self):
+        handler = _RecordingHandler()
+        guardrail = self._guardrail(handler)
+        messages = [
+            {"role": "system", "content": f"you are {self.MARKER}"},
+            {"role": "user", "content": "hello"},
+        ]
+
+        result = await guardrail.apply_guardrail(
+            inputs={"texts": ["hello"], "structured_messages": messages},
+            request_data={},
+            input_type="request",
+            logging_obj=_StubLoggingObj(),
+        )
+
+        assert handler.calls == []
+        assert result["texts"] == ["hello"]
+
+    @pytest.mark.asyncio
+    async def test_marker_in_user_message_does_not_skip(self):
+        """Anchoring to the system message keeps pasted content from skipping the guardrail."""
+        handler = _RecordingHandler()
+        guardrail = self._guardrail(handler)
+        messages = [
+            {"role": "system", "content": "you are helpful"},
+            {"role": "user", "content": f"what is {self.MARKER}?"},
+        ]
+
+        await guardrail.apply_guardrail(
+            inputs={"texts": [f"what is {self.MARKER}?"], "structured_messages": messages},
+            request_data={},
+            input_type="request",
+            logging_obj=_StubLoggingObj(),
+        )
+
+        assert len(handler.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_developer_role_prompt_matches(self):
+        handler = _RecordingHandler()
+        guardrail = self._guardrail(handler)
+        messages = [
+            {"role": "developer", "content": [{"type": "text", "text": f"id={self.MARKER}"}]},
+            {"role": "user", "content": "hello"},
+        ]
+
+        await guardrail.apply_guardrail(
+            inputs={"texts": ["hello"], "structured_messages": messages},
+            request_data={},
+            input_type="request",
+            logging_obj=_StubLoggingObj(),
+        )
+
+        assert handler.calls == []
+
+    @pytest.mark.asyncio
+    async def test_paired_response_skipped_via_shared_logging_obj(self):
+        handler = _RecordingHandler()
+        guardrail = self._guardrail(handler)
+        logging_obj = _StubLoggingObj()
+        messages = [{"role": "system", "content": f"you are {self.MARKER}"}]
+
+        await guardrail.apply_guardrail(
+            inputs={"texts": ["hello"], "structured_messages": messages},
+            request_data={},
+            input_type="request",
+            logging_obj=logging_obj,
+        )
+        await guardrail.apply_guardrail(
+            inputs={"texts": ["model output"]},
+            request_data={},
+            input_type="response",
+            logging_obj=logging_obj,
+        )
+
+        assert handler.calls == []
+
+    @pytest.mark.asyncio
+    async def test_paired_response_skipped_via_call_id_cache(self):
+        """Covers the paths where no logging object reaches the hooks."""
+        handler = _RecordingHandler()
+        guardrail = self._guardrail(handler)
+        messages = [{"role": "system", "content": f"you are {self.MARKER}"}]
+
+        await guardrail.apply_guardrail(
+            inputs={"texts": ["hello"], "structured_messages": messages},
+            request_data={"litellm_call_id": "call-xyz"},
+            input_type="request",
+        )
+        await guardrail.apply_guardrail(
+            inputs={"texts": ["model output"]},
+            request_data={"litellm_call_id": "call-xyz"},
+            input_type="response",
+        )
+
+        assert handler.calls == []
+
+    @pytest.mark.asyncio
+    async def test_cache_entry_is_evicted_on_use(self):
+        """A one-shot entry cannot suppress a later, unrelated response."""
+        handler = _RecordingHandler()
+        guardrail = self._guardrail(handler)
+        messages = [{"role": "system", "content": f"you are {self.MARKER}"}]
+
+        await guardrail.apply_guardrail(
+            inputs={"texts": ["hello"], "structured_messages": messages},
+            request_data={"litellm_call_id": "call-xyz"},
+            input_type="request",
+        )
+        for _ in range(2):
+            await guardrail.apply_guardrail(
+                inputs={"texts": ["model output"]},
+                request_data={"litellm_call_id": "call-xyz"},
+                input_type="response",
+            )
+
+        assert len(handler.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_unmatched_request_leaves_response_scanned(self):
+        handler = _RecordingHandler()
+        guardrail = self._guardrail(handler)
+        logging_obj = _StubLoggingObj()
+
+        await guardrail.apply_guardrail(
+            inputs={"texts": ["hello"], "structured_messages": [{"role": "system", "content": "plain"}]},
+            request_data={},
+            input_type="request",
+            logging_obj=logging_obj,
+        )
+        await guardrail.apply_guardrail(
+            inputs={"texts": ["model output"]},
+            request_data={},
+            input_type="response",
+            logging_obj=logging_obj,
+        )
+
+        assert [payload["input_type"] for payload in handler.payloads] == ["request", "response"]
+
+    @pytest.mark.asyncio
+    async def test_skip_decision_does_not_cross_guardrail_instances(self):
+        handler = _RecordingHandler()
+        skipping = self._guardrail(handler, name="skipping-guardrail")
+        other = _make_guardrail(
+            handler,
+            name="other-guardrail",
+            event_hook=["pre_call", "post_call"],
+            skip_if_system_prompt_matches=["something-else"],
+        )
+        logging_obj = _StubLoggingObj()
+        messages = [{"role": "system", "content": f"you are {self.MARKER}"}]
+
+        await skipping.apply_guardrail(
+            inputs={"texts": ["hello"], "structured_messages": messages},
+            request_data={},
+            input_type="request",
+            logging_obj=logging_obj,
+        )
+        await other.apply_guardrail(
+            inputs={"texts": ["model output"]},
+            request_data={},
+            input_type="response",
+            logging_obj=logging_obj,
+        )
+
+        assert len(handler.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_skip_if_first_role_in(self):
+        handler = _RecordingHandler()
+        guardrail = _make_guardrail(handler, skip_if_first_role_in=["developer"])
+
+        await guardrail.apply_guardrail(
+            inputs={
+                "texts": ["hello"],
+                "structured_messages": [
+                    {"role": "developer", "content": "instructions"},
+                    {"role": "user", "content": "hello"},
+                ],
+            },
+            request_data={},
+            input_type="request",
+            logging_obj=_StubLoggingObj(),
+        )
+        assert handler.calls == []
+
+        await guardrail.apply_guardrail(
+            inputs={
+                "texts": ["hello"],
+                "structured_messages": [{"role": "user", "content": "hello"}],
+            },
+            request_data={},
+            input_type="request",
+            logging_obj=_StubLoggingObj(call_id="call-2"),
+        )
+        assert len(handler.calls) == 1
+
+
+class TestIdentityApplicabilityFilter:
+    """skip_if_key_alias_in / skip_if_team_id_in: matched on authenticated metadata."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("input_type", ["request", "response"])
+    async def test_key_alias_skips_both_hooks_without_correlation(self, input_type):
+        """Each hook sees the auth metadata, so the response needs no recorded decision."""
+        handler = _RecordingHandler()
+        guardrail = _make_guardrail(handler, skip_if_key_alias_in=["batch-worker"])
+
+        result = await guardrail.apply_guardrail(
+            inputs={"texts": ["hello"]},
+            request_data={"metadata": {"user_api_key_alias": "batch-worker"}},
+            input_type=input_type,
+        )
+
+        assert handler.calls == []
+        assert result == {"texts": ["hello"]}
+
+    @pytest.mark.asyncio
+    async def test_other_key_alias_still_scanned(self):
+        handler = _RecordingHandler()
+        guardrail = _make_guardrail(handler, skip_if_key_alias_in=["batch-worker"])
+
+        await guardrail.apply_guardrail(
+            inputs={"texts": ["hello"]},
+            request_data={"metadata": {"user_api_key_alias": "prod-app"}},
+            input_type="request",
+        )
+
+        assert len(handler.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_team_id_filter(self):
+        handler = _RecordingHandler()
+        guardrail = _make_guardrail(handler, skip_if_team_id_in=["team-internal"])
+
+        await guardrail.apply_guardrail(
+            inputs={"texts": ["hello"]},
+            request_data={"litellm_metadata": {"user_api_key_team_id": "team-internal"}},
+            input_type="response",
+        )
+        assert handler.calls == []
+
+        await guardrail.apply_guardrail(
+            inputs={"texts": ["hello"]},
+            request_data={"litellm_metadata": {"user_api_key_team_id": "team-other"}},
+            input_type="response",
+        )
+        assert len(handler.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_body_cannot_forge_an_identity_exemption(self):
+        """A caller putting the alias in its own messages must not be exempted."""
+        handler = _RecordingHandler()
+        guardrail = _make_guardrail(handler, skip_if_key_alias_in=["batch-worker"])
+
+        await guardrail.apply_guardrail(
+            inputs={
+                "texts": ["batch-worker"],
+                "structured_messages": [{"role": "system", "content": "batch-worker"}],
+            },
+            request_data={"metadata": {"user_api_key_alias": "prod-app"}},
+            input_type="request",
+        )
+
+        assert len(handler.calls) == 1
+
+
+class TestConfigValidationWarnings:
+    """The init-time warnings the config options promise."""
+
+    def test_unknown_call_type_warns_and_keeps_the_value(self, caplog):
+        with caplog.at_level("WARNING", logger="LiteLLM Proxy"):
+            guardrail = _make_guardrail(_RecordingHandler(), run_only_on_call_types=["acompletion", "nope"])
+        assert "unrecognized call type" in caplog.text
+        assert guardrail._skip_policy.run_only_on_call_types == frozenset({"acompletion", "nope"})
+
+    def test_allowlist_and_denylist_together_warns(self, caplog):
+        with caplog.at_level("WARNING", logger="LiteLLM Proxy"):
+            _make_guardrail(
+                _RecordingHandler(),
+                run_only_on_call_types=["acompletion"],
+                skip_call_types=["aembedding"],
+            )
+        assert "allowlist wins" in caplog.text
+
+    def test_response_only_mode_warns_that_nothing_can_be_skipped(self, caplog):
+        with caplog.at_level("WARNING", logger="LiteLLM Proxy"):
+            _make_guardrail(
+                _RecordingHandler(),
+                event_hook="post_call",
+                skip_if_system_prompt_matches=["marker"],
+            )
+        assert "request-side hook" in caplog.text
+
+    def test_message_based_filters_warn_about_the_trust_boundary(self, caplog):
+        with caplog.at_level("WARNING", logger="LiteLLM Proxy"):
+            _make_guardrail(_RecordingHandler(), skip_if_system_prompt_matches=["marker"])
+        assert "caller controls" in caplog.text
+
+    def test_identity_filters_do_not_warn(self, caplog):
+        with caplog.at_level("WARNING", logger="LiteLLM Proxy"):
+            _make_guardrail(_RecordingHandler(), skip_if_key_alias_in=["batch-worker"])
+        assert "caller controls" not in caplog.text
