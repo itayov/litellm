@@ -169,6 +169,48 @@ class GenericGuardrailAPIOptionalParams(BaseModel):
         ),
     )
 
+    fire_and_forget: bool | None = Field(
+        default=None,
+        description=(
+            "If True, the guardrail HTTP call is dispatched as a background task and the "
+            "request proceeds immediately without awaiting the response. Applies to every "
+            "mode (pre_call, post_call, during_call), adding ~0 latency. Because the "
+            "response is never awaited, the guardrail is observe-only: action=BLOCKED and "
+            "action=GUARDRAIL_INTERVENED are ignored. Also forces "
+            "streaming_end_of_stream_only=True so a stream dispatches one background call "
+            "instead of one per sampled chunk. Defaults to False in "
+            "GenericGuardrailAPI.__init__ when None."
+        ),
+    )
+
+    fire_and_forget_max_inflight: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Maximum number of fire_and_forget calls in flight at once. Async dispatch "
+            "decouples the request rate from the guardrail endpoint's throughput, so a slow "
+            "endpoint would otherwise pile up tasks without bound. Calls beyond this limit "
+            "are dropped and counted, with a rate-limited warning. Ignored unless "
+            "fire_and_forget is True. Defaults to 100 in GenericGuardrailAPI.__init__ when None."
+        ),
+    )
+
+    guardrail_information_scope: Literal["per_call", "per_session", "off"] | None = Field(
+        default=None,
+        description=(
+            "How often this guardrail records a StandardLoggingGuardrailInformation entry "
+            "into request metadata (spend logs / OTEL). Every invocation records one today, "
+            "with no cap and no dedup, so a long agent session accumulates one entry per "
+            "guardrail call in the same row. 'per_call' (default) keeps that behavior. "
+            "'per_session' records only the first call of a session, and needs a resolvable "
+            "session id (litellm_session_id or metadata.session_id); without one it behaves "
+            "as 'per_call' rather than dropping every entry. 'off' records nothing on "
+            "success. Blocks and guardrail failures are recorded under every scope. Dedup "
+            "is per proxy process, so a session spread across workers records once per "
+            "worker. Defaults to 'per_call' in GenericGuardrailAPI.__init__ when None."
+        ),
+    )
+
 
 class GenericGuardrailAPIConfigModel(
     GuardrailConfigModel[GenericGuardrailAPIOptionalParams],

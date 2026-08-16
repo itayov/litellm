@@ -18,7 +18,9 @@ from litellm._version import version as litellm_version
 from litellm.exceptions import GuardrailRaisedException, Timeout
 from litellm.integrations.custom_guardrail import (
     CustomGuardrail,
+    get_session_id_from_request_data,
     log_guardrail_information,
+    suppress_guardrail_information_record,
 )
 from litellm.llms.custom_httpx.http_handler import (
     AsyncHTTPHandler,
@@ -34,6 +36,15 @@ from litellm.types.proxy.guardrails.guardrail_hooks.generic_guardrail_api import
 )
 from litellm.types.utils import GenericGuardrailAPIInputs
 
+from .background_dispatch import (
+    DEFAULT_FIRE_AND_FORGET_MAX_INFLIGHT,
+    BackgroundDispatcher,
+)
+from .record_scope import (
+    DEFAULT_GUARDRAIL_INFORMATION_SCOPE,
+    GuardrailInformationScope,
+    RecordScope,
+)
 from .request_filters import (
     SkipDecisionStore,
     SkipPolicy,
@@ -237,7 +248,11 @@ class GenericGuardrailAPI(CustomGuardrail):
         skip_if_team_id_in: Sequence[str] | None = None,
         run_only_on_call_types: Sequence[str] | None = None,
         skip_call_types: Sequence[str] | None = None,
+        fire_and_forget: bool | None = None,
+        fire_and_forget_max_inflight: int | None = None,
+        guardrail_information_scope: GuardrailInformationScope | None = None,
         async_handler: AsyncHTTPHandler | None = None,
+        dispatcher: BackgroundDispatcher | None = None,
         **kwargs,
     ):
         self.async_handler = async_handler or get_async_httpx_client(
@@ -289,6 +304,16 @@ class GenericGuardrailAPI(CustomGuardrail):
 
         configured_name: Final = kwargs.get("guardrail_name")
 
+        self.fire_and_forget: bool = False if fire_and_forget is None else fire_and_forget
+        self._dispatcher: Final = dispatcher or BackgroundDispatcher(
+            guardrail_name=configured_name,
+            max_inflight=(
+                DEFAULT_FIRE_AND_FORGET_MAX_INFLIGHT
+                if fire_and_forget_max_inflight is None
+                else fire_and_forget_max_inflight
+            ),
+        )
+
         self._skip_policy: Final = SkipPolicy(
             system_prompt_patterns=compile_patterns(
                 skip_if_system_prompt_matches, option_name="skip_if_system_prompt_matches"
@@ -310,6 +335,24 @@ class GenericGuardrailAPI(CustomGuardrail):
             ),
         )
         self._skip_store: Final = SkipDecisionStore(guardrail_name=configured_name)
+        self._record_scope: Final = RecordScope(
+            DEFAULT_GUARDRAIL_INFORMATION_SCOPE if guardrail_information_scope is None else guardrail_information_scope
+        )
+
+        if self.fire_and_forget:
+            # Nothing awaits the response, so a block cannot be honored and the
+            # stream can only be observed. Say so at boot rather than surprising
+            # the operator with a guardrail that never blocks.
+            verbose_proxy_logger.warning(
+                "Generic Guardrail API (%s): fire_and_forget=True makes this guardrail observe-only. "
+                "action=BLOCKED and action=GUARDRAIL_INTERVENED are ignored, and "
+                "fail_on_error=%s / unreachable_fallback=%s cannot block the request. "
+                "Streaming is forced to end-of-stream observation.",
+                configured_name,
+                self.fail_on_error,
+                self.unreachable_fallback,
+            )
+            self.streaming_end_of_stream_only = True
 
         if self._skip_policy.filters_requests:
             verbose_proxy_logger.warning(
@@ -442,6 +485,25 @@ class GenericGuardrailAPI(CustomGuardrail):
         self._skip_store.record(logging_obj=logging_obj, call_id=call_id)
         return True
 
+    def _dispatch_background_post(
+        self,
+        *,
+        payload: Mapping[str, JsonValue],
+        headers: Mapping[str, str],
+        input_type: Literal["request", "response"],
+        logging_obj: Optional["LiteLLMLoggingObj"],
+    ) -> None:
+        context: Final = (
+            f"input_type={input_type} "
+            f"litellm_call_id={getattr(logging_obj, 'litellm_call_id', None) if logging_obj else None}"
+        )
+
+        async def _post() -> None:
+            response: Final = await self.async_handler.post(url=self.api_base, json=payload, headers=headers)
+            response.raise_for_status()
+
+        self._dispatcher.dispatch(_post, context=context)
+
     def _build_payload(self, guardrail_request: GenericGuardrailAPIRequest) -> Mapping[str, JsonValue]:
         """Build the JSON body for the guardrail call.
 
@@ -505,6 +567,39 @@ class GenericGuardrailAPI(CustomGuardrail):
 
     @log_guardrail_information
     async def apply_guardrail(
+        self,
+        inputs: GenericGuardrailAPIInputs,
+        request_data: dict,
+        input_type: Literal["request", "response"],
+        logging_obj: Optional["LiteLLMLoggingObj"] = None,
+    ) -> GenericGuardrailAPIInputs:
+        """Run the guardrail, then decide whether this call records a log entry.
+
+        The suppression flag is set only once the call has returned normally, so
+        a block or a guardrail failure still records under every scope: the
+        decorator's exception branch reads the same flag.
+        """
+        result: Final = await self._apply_guardrail(
+            inputs=inputs,
+            request_data=request_data,
+            input_type=input_type,
+            logging_obj=logging_obj,
+        )
+        # The session id is caller-supplied, so the dedup key is namespaced by the
+        # authenticated caller: the key hash is unique per virtual key, with the
+        # team id as the fallback. Both come from auth, not from the body.
+        identity: Final = (
+            self._extract_user_api_key_metadata(request_data) if request_data else GenericGuardrailAPIMetadata()
+        )
+        session_id: Final = get_session_id_from_request_data(request_data) if request_data else None
+        if self._record_scope.should_suppress(
+            session_id,
+            tenant=identity.get("user_api_key_hash") or identity.get("user_api_key_team_id"),
+        ):
+            suppress_guardrail_information_record()
+        return result
+
+    async def _apply_guardrail(
         self,
         inputs: GenericGuardrailAPIInputs,
         request_data: dict,
@@ -616,10 +711,21 @@ class GenericGuardrailAPI(CustomGuardrail):
 
             headers: Final = self._build_request_headers()
 
+            payload: Final = self._build_payload(guardrail_request)
+
+            if self.fire_and_forget:
+                self._dispatch_background_post(
+                    payload=payload,
+                    headers=headers,
+                    input_type=input_type,
+                    logging_obj=logging_obj,
+                )
+                return _passthrough_inputs(inputs)
+
             # Make the API request
             response: Final = await self.async_handler.post(
                 url=self.api_base,
-                json=self._build_payload(guardrail_request),
+                json=payload,
                 headers=headers,
             )
 

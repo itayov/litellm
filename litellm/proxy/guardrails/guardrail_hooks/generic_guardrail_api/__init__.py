@@ -47,6 +47,9 @@ def initialize_guardrail(litellm_params: "LitellmParams", guardrail: "Guardrail"
         skip_if_team_id_in=_get_config_value(litellm_params, optional_params, "skip_if_team_id_in"),
         run_only_on_call_types=_get_config_value(litellm_params, optional_params, "run_only_on_call_types"),
         skip_call_types=_get_config_value(litellm_params, optional_params, "skip_call_types"),
+        fire_and_forget=_get_config_value(litellm_params, optional_params, "fire_and_forget"),
+        fire_and_forget_max_inflight=_get_config_value(litellm_params, optional_params, "fire_and_forget_max_inflight"),
+        guardrail_information_scope=_get_config_value(litellm_params, optional_params, "guardrail_information_scope"),
     )
 
     litellm.logging_callback_manager.add_litellm_callback(_generic_guardrail_api_callback)
