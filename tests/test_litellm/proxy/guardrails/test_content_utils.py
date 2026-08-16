@@ -5,6 +5,7 @@ from litellm.proxy.guardrails._content_utils import (
     build_inspection_messages,
     has_non_string_content,
     iter_message_text,
+    map_content_text,
     walk_user_text,
 )
 
@@ -563,3 +564,31 @@ def test_build_inspection_messages_custom_tool_call_output():
     }
     msgs = build_inspection_messages(data)
     assert any("custom-tool-leak" in m["content"] for m in msgs)
+
+
+# ── map_content_text ────────────────────────────────────────────────────────────
+
+
+def test_map_content_text_transforms_string_and_text_parts_only():
+    content = [
+        {"type": "text", "text": "keep me"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+        "bare fragment",
+    ]
+    assert map_content_text(content, lambda t: t.upper()) == [
+        {"type": "text", "text": "KEEP ME"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+        "BARE FRAGMENT",
+    ]
+
+
+def test_map_content_text_does_not_mutate_the_input():
+    content = [{"type": "text", "text": "original"}]
+    map_content_text(content, lambda t: "changed")
+    assert content == [{"type": "text", "text": "original"}]
+
+
+
+
+
+

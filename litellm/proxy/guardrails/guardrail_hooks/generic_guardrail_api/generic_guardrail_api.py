@@ -7,9 +7,11 @@
 
 import fnmatch
 import os
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Final, Literal, Optional
 
 import httpx
+from pydantic import JsonValue
 
 from litellm._logging import verbose_proxy_logger
 from litellm._version import version as litellm_version
@@ -146,6 +148,11 @@ def _extract_inbound_headers(
             pass
 
     return None
+
+
+def _passthrough_inputs(inputs: GenericGuardrailAPIInputs) -> GenericGuardrailAPIInputs:
+    """Return the inputs untouched (same value identities), as action=NONE."""
+    return GenericGuardrailAPIInputs(**inputs)
 
 
 class GenericGuardrailAPI(CustomGuardrail):
@@ -303,9 +310,16 @@ class GenericGuardrailAPI(CustomGuardrail):
             exc_info=error,
         )
         # Keep flow going - treat as action=NONE (no modifications)
-        return_inputs: Final[GenericGuardrailAPIInputs] = {}
-        return_inputs.update(inputs)
-        return return_inputs
+        return _passthrough_inputs(inputs)
+
+    def _build_payload(self, guardrail_request: GenericGuardrailAPIRequest) -> Mapping[str, JsonValue]:
+        """Build the JSON body for the guardrail call.
+
+        One home for payload construction, so what is sent is decided in a single
+        place rather than inline at the call site. mode="json" ensures all
+        iterables are converted to lists.
+        """
+        return guardrail_request.model_dump(mode="json")
 
     def _build_request_headers(self) -> dict:
         """Build HTTP headers for the guardrail API request."""
@@ -441,10 +455,9 @@ class GenericGuardrailAPI(CustomGuardrail):
             headers: Final = self._build_request_headers()
 
             # Make the API request
-            # Use mode="json" to ensure all iterables are converted to lists
             response: Final = await self.async_handler.post(
                 url=self.api_base,
-                json=guardrail_request.model_dump(mode="json"),
+                json=self._build_payload(guardrail_request),
                 headers=headers,
             )
 
